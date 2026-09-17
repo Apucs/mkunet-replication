@@ -162,7 +162,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
     
 if __name__ == '__main__':
     # Initial defaults
-    dataset_name = 'ColonDB' #'ColonDB'
+    dataset_name = 'SugarBeets' #'ColonDB'
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--network', type=str, default='MK_UNet', 
