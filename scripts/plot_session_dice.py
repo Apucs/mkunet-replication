@@ -7,6 +7,7 @@ reference line at the in-domain ClinicDB score for comparison.
 Usage:
     python scripts/plot_session_dice.py eval_by_session_run4.txt figures/session_dice.png
 """
+import os
 import re
 import sys
 from datetime import datetime
@@ -43,6 +44,7 @@ def label_of(session):
 
 def main():
     table_path, out_path = sys.argv[1], sys.argv[2]
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     rows = parse(table_path)
     labels = [label_of(s) for s, _, _ in rows]
     dice = [d for _, _, d in rows]
