@@ -46,8 +46,8 @@ def main():
         batchsize=8, trainsize=args.img_size, shuffle=False, split='test', color_image=True,
     )
 
-    # pass 1: per-image dice + cached binary predictions at original resolution
-    results = {}  # name -> (dice, pred_binary ndarray HxW)
+    # pass 1: per-image dice (training protocol) + raw sigmoid maps at network resolution
+    results = {}  # name -> (dice, soft prediction tensor 1x1xSxS)
     with torch.no_grad():
         for images, gts, original_shapes, names in loader:
             images, gts = images.cuda(), gts.cuda().float()
@@ -61,7 +61,7 @@ def main():
                 g = F.interpolate(gts[i].unsqueeze(0), size=(h, w), mode='nearest').squeeze()
                 pb, gb = (p >= 0.5).float(), (g >= 0.2).float()
                 d = dice_coefficient(pb, gb).item()
-                results[Path(names[i]).name] = (d, pb.cpu().numpy().astype(bool))
+                results[Path(names[i]).name] = (d, preds[i].detach().unsqueeze(0).cpu())
 
     if args.names:
         chosen = args.names
@@ -72,9 +72,14 @@ def main():
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     for name in chosen:
-        d, pred = results[name]
+        d, soft = results[name]
         img = np.array(Image.open(Path(args.test_path) / 'images' / name).convert('RGB'))
         gt = np.array(Image.open(Path(args.test_path) / 'masks' / name).convert('L')) > 50
+        # resize prediction to the image's true (H, W) — don't trust the loader's shape order
+        p = F.interpolate(soft, size=gt.shape, mode='bilinear', align_corners=False)
+        p = p.sigmoid().squeeze()
+        p = (p - p.min()) / (p.max() - p.min() + 1e-8)
+        pred = (p >= 0.5).numpy()
         overlay = img.copy()
         overlay[pred & gt] = [0, 200, 0]        # true positive: green
         overlay[~pred & gt] = [220, 0, 0]       # missed plant: red
