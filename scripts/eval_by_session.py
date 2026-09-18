@@ -47,7 +47,11 @@ def main():
     args = ap.parse_args()
 
     model = MK_UNet(num_classes=1, in_channels=3, channels=NET_CONFIGS[args.network])
-    model.load_state_dict(torch.load(args.checkpoint, map_location='cuda'))
+    state = torch.load(args.checkpoint, map_location='cuda')
+    # drop thop profiler bookkeeping buffers that cal_params_flops() left in the checkpoint
+    state = {k: v for k, v in state.items()
+             if not k.endswith(('total_ops', 'total_params'))}
+    model.load_state_dict(state)
     model.cuda().eval()
 
     loader = get_loader(
