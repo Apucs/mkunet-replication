@@ -198,7 +198,7 @@ if __name__ == '__main__':
         print(f"WARNING: Network '{chosen_net}' not found. Defaulting to 'MK_UNet'.")
         chosen_net = 'MK_UNet'
 
-    for run in [1,2,3,4,5]:
+    for run in [1]:
         dict_plot = {'val': [], 'test': []}
         best = 0.0
         test_dice_at_best_val = 0.0
