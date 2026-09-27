@@ -220,7 +220,7 @@ if __name__ == '__main__':
 
         # Build model
         channels = NET_CONFIGS[chosen_net]
-        model = MK_UNet(num_classes=1, in_channels=3, channels=channels)
+        model = MK_UNet(num_classes=1, in_channels=3, channels=channels, kernel_sizes=[3,5,7])
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         '''if torch.cuda.device_count() > 1:
