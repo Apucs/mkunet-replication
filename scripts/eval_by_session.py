@@ -46,7 +46,7 @@ def main():
     ap.add_argument('--img_size', type=int, default=352)
     args = ap.parse_args()
 
-    model = MK_UNet(num_classes=1, in_channels=3, channels=NET_CONFIGS[args.network])
+    model = MK_UNet(num_classes=1, in_channels=3, channels=NET_CONFIGS[args.network],  kernel_sizes=[3,5,7])
     state = torch.load(args.checkpoint, map_location='cuda')
     # drop thop profiler bookkeeping buffers that cal_params_flops() left in the checkpoint
     state = {k: v for k, v in state.items()
