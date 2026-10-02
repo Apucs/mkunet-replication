@@ -98,9 +98,9 @@ In this study, the original implementation of [MK-UNet](https://arxiv.org/pdf/25
 
 All artifacts are in this repository (https://github.com/Apucs/mkunet-replication):
 
-- `logs_clinicdb_5runs.txt`, `logs_colondb_5runs.txt`, `logs_sugarbeets_5runs.txt` — full training output, 5 runs each, with FINAL RESULTS blocks
-- `logs/` — per-run epoch-level logs written by the training script
-- `env_gpu.txt`, `env_freeze.txt`, `env_commit.txt` — hardware, package versions, and code commit for the runs
-- `scripts/convert_sugarbeets.py`, `scripts/eval_by_session.py` — dataset conversion (seeded) and growth-stage evaluation
-- `eval_by_session_run4.txt` — the growth-stage table's source output
+- `logs_clinicdb_5runs.txt`, `logs_colondb_5runs.txt`, `logs_sugarbeets_5runs.txt`: full training output, 5 runs each, with FINAL RESULTS blocks
+- `logs/`: per-run epoch-level logs written by the training script
+- `env_gpu.txt`, `env_freeze.txt`: GPU, package versions
+- `scripts/convert_sugarbeets.py`, `scripts/eval_by_session.py`: dataset conversion (seeded) and growth-stage evaluation
+- `eval_by_session_run4.txt`: the growth-stage table's source output
 - `figures/` — qualitative examples (image / ground truth / prediction)
