@@ -103,4 +103,4 @@ All artifacts are in this repository (https://github.com/Apucs/mkunet-replicatio
 - `env_gpu.txt`, `env_freeze.txt`: GPU, package versions
 - `scripts/convert_sugarbeets.py`, `scripts/eval_by_session.py`: dataset conversion (seeded) and growth-stage evaluation
 - `eval_by_session_run4.txt`: the growth-stage table's source output
-- `figures/` — qualitative examples (image / ground truth / prediction)
+- `figures/`: qualitative examples (image / ground truth / prediction)
