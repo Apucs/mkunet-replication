@@ -17,7 +17,7 @@ In this study, the original implementation of [MK-UNet](https://arxiv.org/pdf/25
 
 - Model no of parameters: script reports `0.3156 M params` (paper: `0.316 M`)
 
-- Publihsed numbers have been reproduced
+- Published numbers have been reproduced
 
 - Training command used: 
 `CUDA_VISIBLE_DEVICES=0 python -W ignore train_polyp.py --network MK_UNet
@@ -94,3 +94,13 @@ In this study, the original implementation of [MK-UNet](https://arxiv.org/pdf/25
 | 4 | 0.9331 | 0.8840 | 0.8313 |
 | 5 | 0.9363 | 0.9116 | 0.8123 |
 | **mean ± std** | **0.9353 ± 0.0033** | **0.8948 ± 0.0238** | **0.8169 ± 0.0086** |
+## 5. Artifacts
+
+All artifacts are in this repository (https://github.com/Apucs/mkunet-replication):
+
+- `logs_clinicdb_5runs.txt`, `logs_colondb_5runs.txt`, `logs_sugarbeets_5runs.txt` — full training output, 5 runs each, with FINAL RESULTS blocks
+- `logs/` — per-run epoch-level logs written by the training script
+- `env_gpu.txt`, `env_freeze.txt`, `env_commit.txt` — hardware, package versions, and code commit for the runs
+- `scripts/convert_sugarbeets.py`, `scripts/eval_by_session.py` — dataset conversion (seeded) and growth-stage evaluation
+- `eval_by_session_run4.txt` — the growth-stage table's source output
+- `figures/` — qualitative examples (image / ground truth / prediction)
