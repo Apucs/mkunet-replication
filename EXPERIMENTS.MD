@@ -94,6 +94,7 @@ In this study, the original implementation of [MK-UNet](https://arxiv.org/pdf/25
 | 4 | 0.9331 | 0.8840 | 0.8313 |
 | 5 | 0.9363 | 0.9116 | 0.8123 |
 | **mean ± std** | **0.9353 ± 0.0033** | **0.8948 ± 0.0238** | **0.8169 ± 0.0086** |
+
 ## 5. Artifacts
 
 All artifacts are in this repository (https://github.com/Apucs/mkunet-replication):
