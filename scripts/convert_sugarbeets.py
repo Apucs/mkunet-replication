@@ -34,8 +34,6 @@ def collect_pairs(root: Path):
             continue
         for imap in sorted(imap_dir.glob("*.png")):
             rgb = rgb_dir / imap.name
-            print(session.name, rgb.name, imap.name)
-            # sys.exit(1)
             if rgb.exists():
                 pairs.append((rgb, imap, f"{session.name}_{imap.name}"))
     return pairs
