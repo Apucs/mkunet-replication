@@ -1,7 +1,6 @@
 import os
 import numpy as np
 from PIL import Image
-from pathlib import Path
 
 # resolve the archive relative to THIS FILE, so it works from any working directory
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,13 +28,9 @@ print(im.dtype, im.shape, np.unique(im))
 folder = os.path.join(root, 'CKA_weeds', 'annotations', 'dlp', 'iMapCleaned')
 limit = 10
 print(f'\nunique values of first {limit} files in {os.path.basename(folder)}:')
-for f in sorted(os.listdir(folder))[-200:]:
+for f in sorted(os.listdir(folder))[:limit]:
     a = np.array(Image.open(os.path.join(folder, f)))
     print(f'{f:35s} {list(np.unique(a))}')
-
-
-img_name = Path("/mnt/E2AE16C1AE168DE3/research/mr_tt/datasets/sugarbeets_raw/ijrr_sugarbeets_2016_annotations/CKA_160421/annotations/dlp/iMapCleaned/1461247064_539602853.png")
-print(img_name.name)
 
 # # vegetation-pixel distribution: how many plant pixels per annotated frame?
 # # (this is what justifies MIN_FG_PIXELS = 100 in convert_sugarbeets.py)
