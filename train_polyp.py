@@ -16,6 +16,8 @@ from mkunet_network import MK_UNet
 from utils.dataloader_polyp import get_loader
 from utils.utils import clip_gradient, adjust_lr, AvgMeter, cal_params_flops
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def structure_loss(pred, mask, w=1):
     weit = 1 + 5 * torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15) - mask)
@@ -28,6 +30,60 @@ def structure_loss(pred, mask, w=1):
     wiou = 1 - (inter + 1) / (union - inter + 1)
 
     return (w * (wbce + wiou)).mean()
+
+def multiclass_dice_loss(logits, target, num_classes, smooth=1e-6):
+    """Macro soft dice over foreground classes (background class 0 excluded).
+
+    logits: [B, C, H, W] raw model output; target: [B, H, W] long.
+    """
+    probs = F.softmax(logits, dim=1)
+    target_1h = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+
+    inter = (probs * target_1h).sum(dim=(2, 3))                    # [B, C]
+    total = probs.sum(dim=(2, 3)) + target_1h.sum(dim=(2, 3))      # [B, C]
+    dice = (2 * inter + smooth) / (total + smooth)                 # [B, C]
+
+    return 1 - dice[:, 1:].mean()
+
+def ce_dice_loss(logits, target, num_classes):
+    """Multiclass loss: cross entropy + macro foreground dice. target: [B, H, W] long."""
+    return F.cross_entropy(logits, target) + multiclass_dice_loss(logits, target, num_classes)
+
+def multiclass_structure_loss(logits, target, num_classes, w=1):
+    """Faithful multiclass port of structure_loss: boundary-weighted CE +
+    boundary-weighted soft IoU over foreground classes.
+
+    For num_classes=2 this reduces exactly to the binary structure_loss.
+    logits: [B, C, H, W]; target: [B, H, W] long.
+    """
+    # 1. Predictions and ground truth
+    probs = F.softmax(logits, dim=1)
+    gt = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+
+    # 2. Boundary weights (pad the label map with class 0 before one-hot,
+    #    so "outside the image" counts as background in every channel)
+    padded = F.pad(target, (15, 15, 15, 15), value=0)
+    padded_gt = F.one_hot(padded, num_classes).permute(0, 3, 1, 2).float()
+
+    local_avg = F.avg_pool2d(padded_gt, kernel_size=31, stride=1)
+    weights = 1 + 5 * torch.abs(local_avg - gt)
+
+    # 3. Weighted Cross-Entropy (each pixel weighted at its true class)
+    ce = F.cross_entropy(logits, target, reduction="none")
+    pixel_weights = (weights * gt).sum(dim=1)
+
+    wce = (ce * pixel_weights).sum((1, 2)) / pixel_weights.sum((1, 2))
+
+    # 4. Weighted Soft IoU over foreground classes
+    overlap = probs * gt
+    inter = (overlap * weights).sum((2, 3))
+    union = ((probs + gt - overlap) * weights).sum((2, 3))
+
+    wiou = 1 - (inter + 1) / (union + 1)
+    wiou = wiou[:, 1:].mean(dim=1)
+
+    # 5. Final loss
+    return (w * (wce + wiou)).mean()
 
 def dice_coefficient(predicted, labels):
     if predicted.device != labels.device:
@@ -56,17 +112,17 @@ def test(model, path, dataset, opt):
     model.eval()
     
     test_loader = get_loader(
-        image_root=image_root, gt_root=gt_root, 
+        image_root=image_root, gt_root=gt_root,
         batchsize=opt.test_batchsize, trainsize=opt.img_size,
         shuffle=False, split='test', color_image=opt.color_image
     )
-    
+
     DSC, IOU, total_images = 0.0, 0.0, 0
     with torch.no_grad():
         for pack in test_loader:
-            images, gts, original_shapes, _ = pack       
-            images = images.cuda()
-            gts = gts.cuda().float()
+            images, gts, original_shapes, _ = pack
+            images = images.to(DEVICE)
+            gts = gts.to(DEVICE).float()
 
             ress = model(images)
             # Take the primary output
@@ -103,6 +159,64 @@ def test(model, path, dataset, opt):
 
     return DSC / total_images, IOU / total_images, total_images
 
+def test_multiclass(model, path, dataset, opt):
+    """Per-class evaluation via argmax over class channels.
+
+    Returns (mean_fg_dice, per_class_dice, per_class_iou, n_images).
+    Per-class scores are averaged only over images whose GT contains that
+    class, so an absent class neither inflates nor deflates the average.
+    """
+    data_path = os.path.join(path, dataset)
+    image_root = f'{data_path}/images/'
+    gt_root = f'{data_path}/masks/'
+    model.eval()
+
+    test_loader = get_loader(
+        image_root=image_root, gt_root=gt_root,
+        batchsize=opt.test_batchsize, trainsize=opt.img_size,
+        shuffle=False, split='test', color_image=opt.color_image,
+        num_classes=opt.num_classes
+    )
+
+    C = opt.num_classes
+    dice_sum, iou_sum, class_n = np.zeros(C), np.zeros(C), np.zeros(C, dtype=int)
+    total_images = 0
+
+    with torch.no_grad():
+        for pack in test_loader:
+            images, gts, original_shapes, _ = pack
+            images = images.to(DEVICE)
+            gts = gts.to(DEVICE)
+
+            ress = model(images)
+            predictions = ress[0] if isinstance(ress, list) else ress   # [B, C, h, w]
+
+            for i in range(len(images)):
+                h_orig, w_orig = int(original_shapes[0][i]), int(original_shapes[1][i])
+
+                # Resize logits (bilinear on soft scores), then argmax -> label map
+                p = predictions[i].unsqueeze(0)
+                p = F.interpolate(p, size=(h_orig, w_orig), mode='bilinear', align_corners=False)
+                pred_map = p.argmax(dim=1).squeeze(0)                   # [H, W]
+
+                # Resize GT label map with nearest to keep class indices intact
+                g = gts[i].unsqueeze(0).float()
+                gt_map = F.interpolate(g, size=(h_orig, w_orig), mode='nearest').squeeze().long()
+
+                for c in range(C):
+                    if (gt_map == c).any():
+                        pb = (pred_map == c).float()
+                        gb = (gt_map == c).float()
+                        dice_sum[c] += dice_coefficient(pb, gb).item()
+                        iou_sum[c] += iou(pb, gb).item()
+                        class_n[c] += 1
+                total_images += 1
+
+    per_class_dice = np.divide(dice_sum, class_n, out=np.zeros(C), where=class_n > 0)
+    per_class_iou = np.divide(iou_sum, class_n, out=np.zeros(C), where=class_n > 0)
+    mean_fg_dice = per_class_dice[1:].mean()
+    return mean_fg_dice, per_class_dice, per_class_iou, total_images
+
 def train(train_loader, model, optimizer, epoch, opt, model_name):
     model.train()
     global best, test_dice_at_best_val, total_train_time, dict_plot
@@ -113,18 +227,27 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
     total_step = len(train_loader)
 
     for i, (images, gts) in enumerate(train_loader, start=1):
-        for rate in size_rates:            
+        for rate in size_rates:
             optimizer.zero_grad()
-            images, gts = Variable(images).cuda(), Variable(gts).float().cuda()
-    
+            images, gts = images.to(DEVICE), gts.float().to(DEVICE)
+
             if rate != 1:
                 trainsize = int(round(opt.img_size * rate / 32) * 32)
                 images = F.interpolate(images, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
                 gts = F.interpolate(gts, size=(trainsize, trainsize), mode='nearest')
-            
+
             out = model(images)
-            loss = structure_loss(out[0] if isinstance(out, list) else out, gts)
-            
+            logits = out[0] if isinstance(out, list) else out
+            if opt.num_classes == 1:
+                loss = structure_loss(logits, gts)
+            else:
+                # CE wants [B, H, W] long class indices (no channel dim)
+                targets = gts.squeeze(1).long()
+                if opt.mc_loss == 'structure':
+                    loss = multiclass_structure_loss(logits, targets, opt.num_classes)
+                else:
+                    loss = ce_dice_loss(logits, targets, opt.num_classes)
+
             loss.backward()
             clip_gradient(optimizer, opt.clip)
             optimizer.step()
@@ -146,10 +269,16 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
     # Validation and Testing
     epoch_results = {}
     for ds in ['test', 'val']:
-        d_dice, d_iou, _ = test(model, opt.test_path, ds, opt)
+        if opt.num_classes == 1:
+            d_dice, d_iou, _ = test(model, opt.test_path, ds, opt)
+            msg = f'Epoch: {epoch}, Dataset: {ds}, Dice: {d_dice:.4f}, IoU: {d_iou:.4f}'
+        else:
+            d_dice, d_cls, i_cls, _ = test_multiclass(model, opt.test_path, ds, opt)
+            cls_str = ' '.join(f'c{c}:{d_cls[c]:.4f}' for c in range(opt.num_classes))
+            msg = f'Epoch: {epoch}, Dataset: {ds}, MeanFG Dice: {d_dice:.4f}, per-class [{cls_str}]'
         epoch_results[ds] = d_dice
-        logging.info(f'Epoch: {epoch}, Dataset: {ds}, Dice: {d_dice:.4f}, IoU: {d_iou:.4f}')
-        print(f'Epoch: {epoch}, Dataset: {ds}, Dice: {d_dice:.4f}, IoU: {d_iou:.4f}')
+        logging.info(msg)
+        print(msg)
         dict_plot[ds].append(d_dice)
 
     # Check if Best Validation Dice
@@ -161,12 +290,14 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
         torch.save(model.state_dict(), os.path.join(save_path, f"{model_name}-best.pth"))
     
 if __name__ == '__main__':
-    # Initial defaults
-    dataset_name = 'SugarBeets' #'ColonDB'
-    
     parser = argparse.ArgumentParser()
-    parser.add_argument('--network', type=str, default='MK_UNet', 
-                        choices=['MK_UNet_T', 'MK_UNet_S', 'MK_UNet', 'MK_UNet_M', 'MK_UNet_L'])    
+    parser.add_argument('--network', type=str, default='MK_UNet',
+                        choices=['MK_UNet_T', 'MK_UNet_S', 'MK_UNet', 'MK_UNet_M', 'MK_UNet_L'])
+    parser.add_argument('--dataset', type=str, default='SugarBeets')
+    parser.add_argument('--num_classes', type=int, default=1,
+                        help='1 = binary (sigmoid + structure_loss); >1 = multiclass (softmax + CE/dice)')
+    parser.add_argument('--mc_loss', type=str, default='ce_dice', choices=['ce_dice', 'structure'],
+                        help='multiclass loss: ce_dice (CE + macro dice) or structure (boundary-weighted CE + soft IoU)')
     parser.add_argument('--epoch', type=int, default=200)
     parser.add_argument('--lr', type=float, default=0.0005) # base learning rate is 0.0005 for CosineAnnealingLR and 0.0001 for no scheduler
     parser.add_argument('--batchsize', type=int, default=8)
@@ -177,10 +308,16 @@ if __name__ == '__main__':
     parser.add_argument('--decay_epoch', type=int, default=300)
     parser.add_argument('--color_image', default=True)
     parser.add_argument('--augmentation', default=True)
-    parser.add_argument('--train_path', type=str, default=f'./data/polyp/target/{dataset_name}/train/')
-    parser.add_argument('--test_path', type=str, default=f'./data/polyp/target/{dataset_name}/')
-    parser.add_argument('--train_save', type=str, default='') 
+    parser.add_argument('--train_path', type=str, default='')
+    parser.add_argument('--test_path', type=str, default='')
+    parser.add_argument('--train_save', type=str, default='')
     opt = parser.parse_args()
+
+    dataset_name = opt.dataset
+    if not opt.train_path:
+        opt.train_path = f'./data/polyp/target/{dataset_name}/train/'
+    if not opt.test_path:
+        opt.test_path = f'./data/polyp/target/{dataset_name}/'
 
     # Network configuration mapping
     NET_CONFIGS = {
@@ -205,7 +342,8 @@ if __name__ == '__main__':
         total_train_time = 0
 
         timestamp = time.strftime('%H%M%S')
-        run_id = (f"{dataset_name}_{chosen_net}_bs{opt.batchsize}_lr{opt.lr}_"
+        cls_tag = f"c{opt.num_classes}_" if opt.num_classes > 1 else ""
+        run_id = (f"{dataset_name}_{chosen_net}_{cls_tag}bs{opt.batchsize}_lr{opt.lr}_"
                       f"e{opt.epoch}_aug{opt.augmentation}_run{run}_t{timestamp}")
         opt.train_save = f'./model_pth/{run_id}/'
         
@@ -220,24 +358,24 @@ if __name__ == '__main__':
 
         # Build model
         channels = NET_CONFIGS[chosen_net]
-        model = MK_UNet(num_classes=1, in_channels=3, channels=channels)
+        model = MK_UNet(num_classes=opt.num_classes, in_channels=3, channels=channels)
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         '''if torch.cuda.device_count() > 1:
             print("Let's use", torch.cuda.device_count(), "GPUs!")
             model = nn.DataParallel(model)'''
 
-        model.to(device)
+        model.to(DEVICE)
 
-        print(f"Network: {chosen_net} | Channels: {channels}")
+        print(f"Network: {chosen_net} | Channels: {channels} | Classes: {opt.num_classes} | Device: {DEVICE}")
         cal_params_flops(model, opt.img_size, logging)
         optimizer = torch.optim.AdamW(model.parameters(), opt.lr, weight_decay=1e-4)
         scheduler = CosineAnnealingLR(optimizer, T_max=opt.epoch, eta_min=1e-6)
 
         train_loader = get_loader(
             image_root=f'{opt.train_path}/images/', gt_root=f'{opt.train_path}/masks/',
-            batchsize=opt.batchsize, trainsize=opt.img_size, 
-            shuffle=True, augmentation=opt.augmentation, split='train', color_image=opt.color_image
+            batchsize=opt.batchsize, trainsize=opt.img_size,
+            shuffle=True, augmentation=opt.augmentation, split='train', color_image=opt.color_image,
+            num_classes=opt.num_classes
         )
 
         for epoch in range(1, opt.epoch + 1):

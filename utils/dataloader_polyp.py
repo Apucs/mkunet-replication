@@ -10,13 +10,15 @@ from albumentations.pytorch import ToTensorV2
 class PolypDataset(data.Dataset):
     """
     Unified adaptive dataloader for polyp segmentation.
-    Uses Albumentations and strictly handles binary mask conversion.
+    Uses Albumentations. num_classes=1 (default) applies adaptive binary mask
+    conversion; num_classes>1 keeps masks as integer class indices 0..C-1.
     """
-    def __init__(self, image_root, gt_root, trainsize, augmentation, split='train', color_image=True):
+    def __init__(self, image_root, gt_root, trainsize, augmentation, split='train', color_image=True, num_classes=1):
         self.trainsize = trainsize
         self.color_image = color_image
         self.augmentation = augmentation
         self.split = split
+        self.num_classes = num_classes
         
         # Load and sort file paths
         exts = ('.jpg', '.png', '.jpeg', '.tif')
@@ -67,15 +69,19 @@ class PolypDataset(data.Dataset):
         image = augmented['image']
         mask = augmented['mask']
 
-        # 4. Adaptive Binary Mask Logic
-        # Thinking carefully: This handles 0/255 with noise and 0/1/2/3 labels.
-        max_val = mask.max()
-        if max_val > 127.0:
-            # Treats everything above 20 as foreground to catch 255 but ignore noise
-            mask = (mask > 20).long()
+        # 4. Mask Logic
+        if self.num_classes == 1:
+            # Adaptive binary conversion: handles 0/255 with noise and 0/1/2/3 labels.
+            max_val = mask.max()
+            if max_val > 127.0:
+                # Treats everything above 20 as foreground to catch 255 but ignore noise
+                mask = (mask > 20).long()
+            else:
+                # Treats all integer labels (1, 2, 3...) as foreground
+                mask = (mask >= 1).long()
         else:
-            # Treats all integer labels (1, 2, 3...) as foreground
-            mask = (mask >= 1).long()
+            # Multiclass: mask already holds class indices 0..C-1, keep them
+            mask = mask.long()
 
         if len(mask.shape) == 2:
             mask = mask.unsqueeze(0)
@@ -94,7 +100,7 @@ class PolypDataset(data.Dataset):
     def __len__(self):
         return self.size
 
-def get_loader(image_root, gt_root, batchsize, trainsize, shuffle=False, num_workers=4, pin_memory=True, augmentation=False, split='train', color_image=True):
-    dataset = PolypDataset(image_root, gt_root, trainsize, augmentation, split, color_image)
+def get_loader(image_root, gt_root, batchsize, trainsize, shuffle=False, num_workers=4, pin_memory=True, augmentation=False, split='train', color_image=True, num_classes=1):
+    dataset = PolypDataset(image_root, gt_root, trainsize, augmentation, split, color_image, num_classes)
     return data.DataLoader(dataset=dataset, batch_size=batchsize, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory)
     
