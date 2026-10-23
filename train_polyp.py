@@ -31,15 +31,21 @@ def structure_loss(pred, mask, w=1):
 
     return (w * (wbce + wiou)).mean()
 
+def sas_weights(target_1h, sas):
+    """Scale-aware [B, C] weights: (a_ref/object_area)^alpha capped at w_max;
+    small objects weigh more. Absent classes get neutral weight 1."""
+    a_ref, alpha, w_max = sas
+    area = target_1h.sum(dim=(2, 3))                               # [B, C] px per class
+    u = (a_ref / area.clamp(min=1.0)).pow(alpha).clamp(max=w_max)  # small -> heavy
+    return torch.where(area > 0, u, torch.ones_like(u))
+
 def multiclass_dice_loss(logits, target, num_classes, smooth=1e-6, sas=None):
     """Macro soft dice over foreground classes (background class 0 excluded).
 
     logits: [B, C, H, W] raw model output; target: [B, H, W] long.
 
-    sas: optional (a_ref, alpha, w_max) tuple. When given, each (image,
-    foreground class) term is weighted by (a_ref/object_area)^alpha, capped
-    at w_max, so small objects contribute more (scale-aware supervision).
-    Absent classes get weight 0.
+    sas: optional (a_ref, alpha, w_max) tuple enabling scale-aware weighting
+    of the per-(image, class) terms (see sas_weights).
     """
     probs = F.softmax(logits, dim=1)
     target_1h = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
@@ -51,11 +57,9 @@ def multiclass_dice_loss(logits, target, num_classes, smooth=1e-6, sas=None):
     if sas is None:
         return 1 - dice[:, 1:].mean()
 
-    a_ref, alpha, w_max = sas
-    area = target_1h.sum(dim=(2, 3))                               # [B, C] px per class
-    u = (a_ref / area.clamp(min=1.0)).pow(alpha).clamp(max=w_max)  # small -> heavy
-    u = (u * (area > 0))[:, 1:]                                    # absent -> 0, fg only
-    return (u * (1 - dice[:, 1:])).sum() / u.sum().clamp(min=smooth)
+    # u.sum() > 0 always (absent classes weigh 1)
+    u = sas_weights(target_1h, sas)[:, 1:]
+    return (u * (1 - dice[:, 1:])).sum() / u.sum()
 
 def ce_dice_loss(logits, target, num_classes, sas=None):
     """Multiclass loss: cross entropy + macro foreground dice (scale-aware
@@ -71,6 +75,8 @@ def measure_aref(mask_root, num_classes, img_size):
         if not f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif')):
             continue
         m = _cv2.imread(os.path.join(mask_root, f), _cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            raise RuntimeError(f"measure_aref: unreadable mask file {os.path.join(mask_root, f)}")
         scale = (img_size * img_size) / (m.shape[0] * m.shape[1])
         for c in range(1, num_classes):
             a = (m == c).sum() * scale
@@ -120,13 +126,11 @@ def multiclass_structure_loss(logits, target, num_classes, w=1, sas=None):
         # 5. Final loss
         return (w * (wce + wiou)).mean()
 
-    # Scale-aware variant: object-size weights on the per-class IoU terms
-    a_ref, alpha, w_max = sas
-    area = gt.sum(dim=(2, 3))                                      # [B, C]
-    u = (a_ref / area.clamp(min=1.0)).pow(alpha).clamp(max=w_max)
-    u = (u * (area > 0))[:, 1:]
-    wiou = (u * wiou[:, 1:]).sum() / u.sum().clamp(min=1e-6)
-    return (w * wce).mean() + wiou
+    # Scale-aware variant: object-size weights on the per-class IoU terms.
+    # u.sum() > 0 always (absent classes weigh 1)
+    u = sas_weights(gt, sas)[:, 1:]
+    wiou = (u * wiou[:, 1:]).sum() / u.sum()
+    return (w * (wce.mean() + wiou))
 
 def dice_coefficient(predicted, labels):
     if predicted.device != labels.device:
@@ -269,10 +273,14 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
     size_rates = [0.75, 1, 1.25] 
     total_step = len(train_loader)
 
-    for i, (images, gts) in enumerate(train_loader, start=1):
+    for i, pack in enumerate(train_loader, start=1):
+        batch_images, batch_gts = pack
+        batch_images = batch_images.to(DEVICE)
+        batch_gts = batch_gts.float().to(DEVICE)
         for rate in size_rates:
             optimizer.zero_grad()
-            images, gts = images.to(DEVICE), gts.float().to(DEVICE)
+            # each rate must resize from the originals, not the previous rate's output
+            images, gts = batch_images, batch_gts
 
             if rate != 1:
                 trainsize = int(round(opt.img_size * rate / 32) * 32)
@@ -282,10 +290,7 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
             out = model(images)
             outs = out if isinstance(out, list) else [out]
 
-            # One weighted loss term per supervised output: [p4] normally,
-            # [p4, p3, p2, p1] under --deep_supervision. Weight halves per
-            # stage (nnU-Net schedule); p4 keeps weight 1.0 so the main
-            # head's gradient scale matches the baseline.
+            # per-head weights 1/2^i, unnormalized so p4 matches the baseline scale
             stage_w = [0.5 ** i for i in range(len(outs))]
 
             if opt.num_classes == 1:
@@ -293,7 +298,12 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
             else:
                 # CE wants [B, H, W] long class indices (no channel dim)
                 targets = gts.squeeze(1).long()
-                sas_cfg = (opt.sas_aref, opt.sas_alpha, opt.sas_wmax) if opt.sas else None
+                if opt.sas:
+                    # areas scale by rate^2 under multi-scale resizing; a_ref follows
+                    a_ref_cur = opt.sas_aref * (images.shape[-1] / opt.img_size) ** 2
+                    sas_cfg = (a_ref_cur, opt.sas_alpha, opt.sas_wmax)
+                else:
+                    sas_cfg = None
                 if opt.mc_loss == 'structure':
                     base = lambda o: multiclass_structure_loss(o, targets, opt.num_classes, sas=sas_cfg)
                 else:
@@ -381,7 +391,6 @@ if __name__ == '__main__':
         opt.test_path = f'./data/polyp/target/{dataset_name}/'
 
     if opt.sas:
-        assert opt.deep_supervision, "--sas requires --deep_supervision"
         assert opt.num_classes > 1, "--sas is implemented for multiclass losses"
         if opt.sas_aref == 'auto':
             opt.sas_aref = measure_aref(f'{opt.train_path}/masks/', opt.num_classes, opt.img_size)
@@ -414,9 +423,10 @@ if __name__ == '__main__':
 
         timestamp = time.strftime('%H%M%S')
         cls_tag = f"c{opt.num_classes}_" if opt.num_classes > 1 else ""
+        fix_tag = "fx_"  # fixed multi-scale protocol; untagged runs used the released loop
         loss_tag = "siou_" if (opt.num_classes > 1 and opt.mc_loss == 'structure') else ""
-        ds_tag = ("sas_" if opt.sas else "ds_") if opt.deep_supervision else ""
-        run_id = (f"{dataset_name}_{chosen_net}_{cls_tag}{loss_tag}{ds_tag}bs{opt.batchsize}_lr{opt.lr}_"
+        ds_tag = ("ds_" if opt.deep_supervision else "") + ("sas_" if opt.sas else "")
+        run_id = (f"{dataset_name}_{chosen_net}_{fix_tag}{cls_tag}{loss_tag}{ds_tag}bs{opt.batchsize}_lr{opt.lr}_"
                       f"e{opt.epoch}_aug{opt.augmentation}_run{run}_t{timestamp}")
         opt.train_save = f'./model_pth/{run_id}/'
         
