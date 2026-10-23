@@ -481,9 +481,10 @@ class MK_UNet_S(nn.Module):
         
 class MK_UNet(nn.Module):
 
-    def __init__(self,  num_classes=1, in_channels=3, channels=[16,32,64,96,160], depths=[1, 1, 1, 1, 1], kernel_sizes=[1,3,5], expansion_factor=2, gag_kernel=3, **kwargs):
+    def __init__(self,  num_classes=1, in_channels=3, channels=[16,32,64,96,160], depths=[1, 1, 1, 1, 1], kernel_sizes=[1,3,5], expansion_factor=2, gag_kernel=3, deep_supervision=False, **kwargs):
         super().__init__()
-        
+        self.deep_supervision = deep_supervision
+
         self.encoder1 = mk_irb_bottleneck(in_channels, channels[0], depths[0], 1, expansion_factor=expansion_factor, dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
         self.encoder2 = mk_irb_bottleneck(channels[0], channels[1], depths[1], 1, expansion_factor=expansion_factor, dw_parallel=True, add=True, kernel_sizes=kernel_sizes)  
         self.encoder3 = mk_irb_bottleneck(channels[1], channels[2], depths[2], 1, expansion_factor=expansion_factor, dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
@@ -573,7 +574,9 @@ class MK_UNet(nn.Module):
        
         p4 = self.out4(out)
 
-        return [p4] #[p4, p3, p2, p1]
+        if self.deep_supervision:
+            return [p4, p3, p2, p1]   # p4 stays first: eval always reads index 0
+        return [p4]
 
 #EOF
 

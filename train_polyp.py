@@ -31,10 +31,15 @@ def structure_loss(pred, mask, w=1):
 
     return (w * (wbce + wiou)).mean()
 
-def multiclass_dice_loss(logits, target, num_classes, smooth=1e-6):
+def multiclass_dice_loss(logits, target, num_classes, smooth=1e-6, sas=None):
     """Macro soft dice over foreground classes (background class 0 excluded).
 
     logits: [B, C, H, W] raw model output; target: [B, H, W] long.
+
+    sas: optional (a_ref, alpha, w_max) tuple. When given, each (image,
+    foreground class) term is weighted by (a_ref/object_area)^alpha, capped
+    at w_max, so small objects contribute more (scale-aware supervision).
+    Absent classes get weight 0.
     """
     probs = F.softmax(logits, dim=1)
     target_1h = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
@@ -43,18 +48,47 @@ def multiclass_dice_loss(logits, target, num_classes, smooth=1e-6):
     total = probs.sum(dim=(2, 3)) + target_1h.sum(dim=(2, 3))      # [B, C]
     dice = (2 * inter + smooth) / (total + smooth)                 # [B, C]
 
-    return 1 - dice[:, 1:].mean()
+    if sas is None:
+        return 1 - dice[:, 1:].mean()
 
-def ce_dice_loss(logits, target, num_classes):
-    """Multiclass loss: cross entropy + macro foreground dice. target: [B, H, W] long."""
-    return F.cross_entropy(logits, target) + multiclass_dice_loss(logits, target, num_classes)
+    a_ref, alpha, w_max = sas
+    area = target_1h.sum(dim=(2, 3))                               # [B, C] px per class
+    u = (a_ref / area.clamp(min=1.0)).pow(alpha).clamp(max=w_max)  # small -> heavy
+    u = (u * (area > 0))[:, 1:]                                    # absent -> 0, fg only
+    return (u * (1 - dice[:, 1:])).sum() / u.sum().clamp(min=smooth)
 
-def multiclass_structure_loss(logits, target, num_classes, w=1):
+def ce_dice_loss(logits, target, num_classes, sas=None):
+    """Multiclass loss: cross entropy + macro foreground dice (scale-aware
+    when sas is given; CE stays uniform). target: [B, H, W] long."""
+    return F.cross_entropy(logits, target) + multiclass_dice_loss(logits, target, num_classes, sas=sas)
+
+def measure_aref(mask_root, num_classes, img_size):
+    """Geometric mean per-image foreground-class area of a mask folder,
+    rescaled to img_size x img_size equivalent pixels. Runs once at startup."""
+    import cv2 as _cv2
+    log_areas = []
+    for f in sorted(os.listdir(mask_root)):
+        if not f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif')):
+            continue
+        m = _cv2.imread(os.path.join(mask_root, f), _cv2.IMREAD_GRAYSCALE)
+        scale = (img_size * img_size) / (m.shape[0] * m.shape[1])
+        for c in range(1, num_classes):
+            a = (m == c).sum() * scale
+            if a >= 1:
+                log_areas.append(np.log(a))
+    assert log_areas, f"no foreground objects found in {mask_root}"
+    return float(np.exp(np.mean(log_areas)))
+
+def multiclass_structure_loss(logits, target, num_classes, w=1, sas=None):
     """Faithful multiclass port of structure_loss: boundary-weighted CE +
     boundary-weighted soft IoU over foreground classes.
 
     For num_classes=2 this reduces exactly to the binary structure_loss.
     logits: [B, C, H, W]; target: [B, H, W] long.
+
+    sas: optional (a_ref, alpha, w_max) tuple. When given, each (image,
+    foreground class) IoU term is weighted by (a_ref/area)^alpha, capped at
+    w_max (scale-aware supervision); the CE term stays boundary-weighted only.
     """
     # 1. Predictions and ground truth
     probs = F.softmax(logits, dim=1)
@@ -80,10 +114,19 @@ def multiclass_structure_loss(logits, target, num_classes, w=1):
     union = ((probs + gt - overlap) * weights).sum((2, 3))
 
     wiou = 1 - (inter + 1) / (union + 1)
-    wiou = wiou[:, 1:].mean(dim=1)
 
-    # 5. Final loss
-    return (w * (wce + wiou)).mean()
+    if sas is None:
+        wiou = wiou[:, 1:].mean(dim=1)
+        # 5. Final loss
+        return (w * (wce + wiou)).mean()
+
+    # Scale-aware variant: object-size weights on the per-class IoU terms
+    a_ref, alpha, w_max = sas
+    area = gt.sum(dim=(2, 3))                                      # [B, C]
+    u = (a_ref / area.clamp(min=1.0)).pow(alpha).clamp(max=w_max)
+    u = (u * (area > 0))[:, 1:]
+    wiou = (u * wiou[:, 1:]).sum() / u.sum().clamp(min=1e-6)
+    return (w * wce).mean() + wiou
 
 def dice_coefficient(predicted, labels):
     if predicted.device != labels.device:
@@ -237,16 +280,25 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                 gts = F.interpolate(gts, size=(trainsize, trainsize), mode='nearest')
 
             out = model(images)
-            logits = out[0] if isinstance(out, list) else out
+            outs = out if isinstance(out, list) else [out]
+
+            # One weighted loss term per supervised output: [p4] normally,
+            # [p4, p3, p2, p1] under --deep_supervision. Weight halves per
+            # stage (nnU-Net schedule); p4 keeps weight 1.0 so the main
+            # head's gradient scale matches the baseline.
+            stage_w = [0.5 ** i for i in range(len(outs))]
+
             if opt.num_classes == 1:
-                loss = structure_loss(logits, gts)
+                loss = sum(w * structure_loss(o, gts) for w, o in zip(stage_w, outs))
             else:
                 # CE wants [B, H, W] long class indices (no channel dim)
                 targets = gts.squeeze(1).long()
+                sas_cfg = (opt.sas_aref, opt.sas_alpha, opt.sas_wmax) if opt.sas else None
                 if opt.mc_loss == 'structure':
-                    loss = multiclass_structure_loss(logits, targets, opt.num_classes)
+                    base = lambda o: multiclass_structure_loss(o, targets, opt.num_classes, sas=sas_cfg)
                 else:
-                    loss = ce_dice_loss(logits, targets, opt.num_classes)
+                    base = lambda o: ce_dice_loss(o, targets, opt.num_classes, sas=sas_cfg)
+                loss = sum(w * base(o) for w, o in zip(stage_w, outs))
 
             loss.backward()
             clip_gradient(optimizer, opt.clip)
@@ -298,6 +350,15 @@ if __name__ == '__main__':
                         help='1 = binary (sigmoid + structure_loss); >1 = multiclass (softmax + CE/dice)')
     parser.add_argument('--mc_loss', type=str, default='ce_dice', choices=['ce_dice', 'structure'],
                         help='multiclass loss: ce_dice (CE + macro dice) or structure (boundary-weighted CE + soft IoU)')
+    parser.add_argument('--deep_supervision', action='store_true',
+                        help='train on all four prediction heads (p4..p1), weights 1.0/0.5/0.25/0.125')
+    parser.add_argument('--sas', action='store_true',
+                        help='scale-aware supervision: weight each (image, class) dice term by (a_ref/area)^alpha')
+    parser.add_argument('--sas_aref', type=str, default='auto',
+                        help="'auto' = geometric mean foreground-class area of the train set "
+                             "(at img_size scale), or an explicit pixel value")
+    parser.add_argument('--sas_alpha', type=float, default=0.5)
+    parser.add_argument('--sas_wmax', type=float, default=10.0)
     parser.add_argument('--epoch', type=int, default=200)
     parser.add_argument('--lr', type=float, default=0.0005) # base learning rate is 0.0005 for CosineAnnealingLR and 0.0001 for no scheduler
     parser.add_argument('--batchsize', type=int, default=8)
@@ -318,6 +379,16 @@ if __name__ == '__main__':
         opt.train_path = f'./data/polyp/target/{dataset_name}/train/'
     if not opt.test_path:
         opt.test_path = f'./data/polyp/target/{dataset_name}/'
+
+    if opt.sas:
+        assert opt.deep_supervision, "--sas requires --deep_supervision"
+        assert opt.num_classes > 1, "--sas is implemented for multiclass losses"
+        if opt.sas_aref == 'auto':
+            opt.sas_aref = measure_aref(f'{opt.train_path}/masks/', opt.num_classes, opt.img_size)
+            print(f"SAS: a_ref = {opt.sas_aref:.0f} px "
+                  f"(geometric mean foreground-class area at {opt.img_size}x{opt.img_size})")
+        else:
+            opt.sas_aref = float(opt.sas_aref)
 
     # Network configuration mapping
     NET_CONFIGS = {
@@ -343,7 +414,9 @@ if __name__ == '__main__':
 
         timestamp = time.strftime('%H%M%S')
         cls_tag = f"c{opt.num_classes}_" if opt.num_classes > 1 else ""
-        run_id = (f"{dataset_name}_{chosen_net}_{cls_tag}bs{opt.batchsize}_lr{opt.lr}_"
+        loss_tag = "siou_" if (opt.num_classes > 1 and opt.mc_loss == 'structure') else ""
+        ds_tag = ("sas_" if opt.sas else "ds_") if opt.deep_supervision else ""
+        run_id = (f"{dataset_name}_{chosen_net}_{cls_tag}{loss_tag}{ds_tag}bs{opt.batchsize}_lr{opt.lr}_"
                       f"e{opt.epoch}_aug{opt.augmentation}_run{run}_t{timestamp}")
         opt.train_save = f'./model_pth/{run_id}/'
         
@@ -358,7 +431,8 @@ if __name__ == '__main__':
 
         # Build model
         channels = NET_CONFIGS[chosen_net]
-        model = MK_UNet(num_classes=opt.num_classes, in_channels=3, channels=channels)
+        model = MK_UNet(num_classes=opt.num_classes, in_channels=3, channels=channels,
+                        deep_supervision=opt.deep_supervision)
 
         '''if torch.cuda.device_count() > 1:
             print("Let's use", torch.cuda.device_count(), "GPUs!")
