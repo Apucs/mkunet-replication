@@ -84,16 +84,49 @@ In this study, the original implementation of [MK-UNet](https://arxiv.org/pdf/25
 | CKA_weeds (Jun, weed species) | 13 | 0.8141 | 0.6875 |
 | **Overall** | **250** | **0.8313** | **0.7217** |
 
+### 3.3. Experiment 3: Three-Class Cross-Domain (SugarBeets3C)
+
+The binary setup merges crop and weed into one vegetation class. This experiment separates them: soil (0) / sugar beet (1) / weed (2), the agronomically relevant task for selective weeding.
+
+#### Dataset Details:
+
+- Script: `scripts/convert_sugarbeets_multiclass.py` - identical frame selection and splits to the binary set (seed 42, 2,000/250/250), only the mask encoding differs
+- Class mapping follows the official `labelMap` in the dataset's bundled `visualizeRandomSample.py`: soil `{0, 1, 97}`, crop `{10000, 10001, 10002}`, weed: all remaining codes (2, 20000-20011 dycot, 20100-20105 grass). Verified against a full scan of all 12,340 annotation files
+- Class pixel share: soil `98.31 %`, crop `1.25 %`, weed `0.44 %`
+- Frames containing crop: 2,351; weed: 1,876; both: 1,727 (of 2,500)
+
+#### Pipeline changes (`--num_classes 3`):
+
+- Loss: cross entropy + macro soft dice over foreground classes (background excluded from the dice term)
+- Evaluation: argmax over class channels, per-class DICE/IoU; each class averaged only over test images whose ground truth contains that class
+- Best epoch selected on validation mean foreground DICE (mean of crop and weed)
+- Training command: `python -W ignore train_polyp.py --dataset SugarBeets3C --num_classes 3`
+
+#### Result (test DICE at best-val epoch, %):
+
+| Run | Best epoch | Mean FG | Soil | Crop | Weed |
+|---|---|---|---|---|---|
+| 1 | 68 | 65.31 | 99.85 | 80.47 | 50.15 |
+| 2 | 40 | 65.33 | 99.86 | 79.72 | 50.94 |
+| 3 | 9 | 63.22 | 99.84 | 78.43 | 48.01 |
+| 4 | 32 | 64.26 | 99.68 | 79.96 | 48.55 |
+| 5 | 127 | 62.25 | 99.85 | 78.66 | 45.84 |
+| **mean ± std** | | **64.07 ± 1.34** | 99.82 ± 0.08 | 79.45 ± 0.87 | 48.70 ± 1.99 |
+
+Time/run: ~7,924 s (comparable to the binary runs).
+
+> [N.B]: Weed, the rare (0.44 % of pixels) and small-object class, scores 30.7 DICE points below crop and also shows the largest run-to-run deviation. The binary vegetation score (81.69) averaged this gap away. Crop alone lands slightly below the binary number, as the model must now also separate crop from weed rather than only vegetation from soil.
+
 ## 4. Per-run test DICE (at best-val epoch)
 
-| Run | ClinicDB | ColonDB | SugarBeets |
-|---|---|---|---|
-| 1 | 0.9315 | 0.8655 | 0.8185 |
-| 2 | 0.9356 | 0.8874 | 0.8114 |
-| 3 | 0.9400 | 0.9256 | 0.8112 |
-| 4 | 0.9331 | 0.8840 | 0.8313 |
-| 5 | 0.9363 | 0.9116 | 0.8123 |
-| **mean ± std** | **0.9353 ± 0.0033** | **0.8948 ± 0.0238** | **0.8169 ± 0.0086** |
+| Run | ClinicDB | ColonDB | SugarBeets | SugarBeets3C (mean FG) |
+|---|---|---|---|---|
+| 1 | 0.9315 | 0.8655 | 0.8185 | 0.6531 |
+| 2 | 0.9356 | 0.8874 | 0.8114 | 0.6533 |
+| 3 | 0.9400 | 0.9256 | 0.8112 | 0.6322 |
+| 4 | 0.9331 | 0.8840 | 0.8313 | 0.6426 |
+| 5 | 0.9363 | 0.9116 | 0.8123 | 0.6225 |
+| **mean ± std** | **0.9353 ± 0.0033** | **0.8948 ± 0.0238** | **0.8169 ± 0.0086** | **0.6407 ± 0.0134** |
 
 ## 5. Artifacts
 
@@ -103,5 +136,7 @@ All artifacts are in this repository (https://github.com/Apucs/mkunet-replicatio
 - `logs/`: per-run epoch-level logs written by the training script
 - `env_gpu.txt`, `env_freeze.txt`: GPU, package versions
 - `scripts/convert_sugarbeets.py`, `scripts/eval_by_session.py`: dataset conversion (seeded) and growth-stage evaluation
+- `scripts/convert_sugarbeets_multiclass.py`, `scripts/dataset_exploration.py`: 3-class conversion (same splits) and raw-data exploration
+- 3-class run logs: `logs/train_log_SugarBeets3C_MK_UNet_c3_bs8_lr0.0005_e200_augTrue_run{1..5}_t*.log` (on the training machine; archived locally)
 - `eval_by_session_run4.txt`: the growth-stage table's source output
 - `figures/`: qualitative examples (image / ground truth / prediction)
