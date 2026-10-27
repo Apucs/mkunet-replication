@@ -117,6 +117,49 @@ Time/run: ~7,924 s (comparable to the binary runs).
 
 > [N.B]: Weed, the rare (0.44 % of pixels) and small-object class, scores 30.7 DICE points below crop and also shows the largest run-to-run deviation. The binary vegetation score (81.69) averaged this gap away. Crop alone lands slightly below the binary number, as the model must now also separate crop from weed rather than only vegetation from soil.
 
+### 3.4. Loss Family: CE+Dice vs Structure Loss (3-class)
+
+Same protocol as 3.3 with `--mc_loss structure` (boundary-weighted CE + soft IoU,
+the multiclass port of the released binary loss; reduces exactly to it for C=2).
+
+| Loss | Runs | Mean FG | Crop | Weed |
+|---|---|---|---|---|
+| CE + dice (3.3) | 5 | 64.07 +- 1.34 | 79.45 | 48.70 |
+| Structure | 3 | 66.98 | 82.56 | 51.40 |
+
+> [N.B]: The structure loss outperforms CE+dice on both foreground classes, so it is
+> used as the main configuration from here on. Three runs sufficed for this
+> selection decision; the definitive 5-run baseline is in 3.5 (fixed loop).
+
+### 3.5. Multi-Scale Loop Fix and Supervision Ablation
+
+While reviewing the training loop we found that the released code reassigns the
+image tensors in place across the multi-scale rates: the rate=1.0 pass trains on
+the 0.75-downscaled tensors and the rate=1.25 pass upsamples those. Verified
+against the released repository and with a shape trace (the model trained at
+256/256/448 instead of 256/352/448, never at sharp native resolution). All runs
+from here on use the corrected loop, tagged `fx_` in the run id; results above
+this section used the released loop and are not comparable to results below.
+
+All rows: SugarBeets3C, structure loss, 5 runs, test DICE (%) at best-val epoch.
+
+| Configuration | Mean FG | Crop | Weed |
+|---|---|---|---|
+| baseline (fixed loop) | 69.87 +- 0.71 | 84.89 | 54.86 +- 0.76 |
+| + deep supervision (weights 1/2^i) | 70.32 +- 0.40 | 85.55 | 55.08 +- 0.88 |
+| + scale-aware supervision (SAS) | 71.24 +- 0.35 | 85.65 +- 0.36 | 56.82 +- 0.37 |
+
+- Deep supervision: loss on all four prediction heads, geometric weights 1.0/0.5/0.25/0.125.
+- SAS: each (image, class) IoU term weighted by (A_ref/area)^0.5 capped at 10;
+  A_ref auto-calibrated as the geometric mean foreground-class area of the train
+  set (211 px at 352x352). Command: `--mc_loss structure --deep_supervision --sas`.
+
+> [N.B]: The loop fix alone is worth +2.9 mean-FG points over 3.4, concentrated in
+> the weed class (+3.5), and halves the run-to-run deviation. Deep supervision
+> alone adds no significant gain. SAS adds +1.74 weed DICE over deep supervision
+> (crop unchanged) and further reduces weed variance, i.e. the gain is specific
+> to the small-object class that SAS targets.
+
 ## 4. Per-run test DICE (at best-val epoch)
 
 | Run | ClinicDB | ColonDB | SugarBeets | SugarBeets3C (mean FG) |
