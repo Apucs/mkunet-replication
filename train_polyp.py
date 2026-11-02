@@ -39,16 +39,39 @@ def sas_weights(target_1h, sas):
     u = (a_ref / area.clamp(min=1.0)).pow(alpha).clamp(max=w_max)  # small -> heavy
     return torch.where(area > 0, u, torch.ones_like(u))
 
-def multiclass_dice_loss(logits, target, num_classes, smooth=1e-6, sas=None):
-    """Macro soft dice over foreground classes (background class 0 excluded).
+def mask_ignored(probs, target, num_classes, ignore_index):
+    """Shared ignore masking: returns (probs, target, one_hot) with ignored
+    pixels zeroed everywhere (all-zero one-hot rows, zeroed probs) and the
+    target remapped to 0 at those pixels. Supported: ignore_index 0 (LoveDA
+    no-data) or -100 (disabled; callers skip this function)."""
+    valid = (target != ignore_index)
+    target = torch.where(valid, target, torch.zeros_like(target))
+    probs = probs * valid.unsqueeze(1)
+    one_hot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float() * valid.unsqueeze(1)
+    return probs, target, one_hot
+
+def safe_ce(logits, target, ignore_index):
+    """CE mean over non-ignored pixels; 0 (not NaN) if a batch has none."""
+    n_valid = (target != ignore_index).sum().clamp(min=1)
+    return F.cross_entropy(logits, target, ignore_index=ignore_index, reduction='sum') / n_valid
+
+def multiclass_dice_loss(logits, target, num_classes, smooth=1e-6, sas=None, ignore_index=-100):
+    """Macro soft dice over channels 1..C-1. Channel 0 is excluded: it is the
+    background class normally, or the never-supervised no-data label when
+    ignore_index=0 (then the real background IS scored, as in LoveDA).
 
     logits: [B, C, H, W] raw model output; target: [B, H, W] long.
 
     sas: optional (a_ref, alpha, w_max) tuple enabling scale-aware weighting
     of the per-(image, class) terms (see sas_weights).
+    ignore_index: label whose pixels are excluded from all terms (e.g. 0 for
+    LoveDA no-data). Default -100 matches no label: masking is skipped.
     """
     probs = F.softmax(logits, dim=1)
-    target_1h = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+    if ignore_index >= 0:
+        probs, target, target_1h = mask_ignored(probs, target, num_classes, ignore_index)
+    else:
+        target_1h = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
 
     inter = (probs * target_1h).sum(dim=(2, 3))                    # [B, C]
     total = probs.sum(dim=(2, 3)) + target_1h.sum(dim=(2, 3))      # [B, C]
@@ -61,10 +84,12 @@ def multiclass_dice_loss(logits, target, num_classes, smooth=1e-6, sas=None):
     u = sas_weights(target_1h, sas)[:, 1:]
     return (u * (1 - dice[:, 1:])).sum() / u.sum()
 
-def ce_dice_loss(logits, target, num_classes, sas=None):
+def ce_dice_loss(logits, target, num_classes, sas=None, ignore_index=-100):
     """Multiclass loss: cross entropy + macro foreground dice (scale-aware
     when sas is given; CE stays uniform). target: [B, H, W] long."""
-    return F.cross_entropy(logits, target) + multiclass_dice_loss(logits, target, num_classes, sas=sas)
+    ce = (safe_ce(logits, target, ignore_index) if ignore_index >= 0
+          else F.cross_entropy(logits, target))
+    return ce + multiclass_dice_loss(logits, target, num_classes, sas=sas, ignore_index=ignore_index)
 
 def measure_aref(mask_root, num_classes, img_size):
     """Geometric mean per-image foreground-class area of a mask folder,
@@ -85,7 +110,7 @@ def measure_aref(mask_root, num_classes, img_size):
     assert log_areas, f"no foreground objects found in {mask_root}"
     return float(np.exp(np.mean(log_areas)))
 
-def multiclass_structure_loss(logits, target, num_classes, w=1, sas=None):
+def multiclass_structure_loss(logits, target, num_classes, w=1, sas=None, ignore_index=-100):
     """Faithful multiclass port of structure_loss: boundary-weighted CE +
     boundary-weighted soft IoU over foreground classes.
 
@@ -96,9 +121,16 @@ def multiclass_structure_loss(logits, target, num_classes, w=1, sas=None):
     foreground class) IoU term is weighted by (a_ref/area)^alpha, capped at
     w_max (scale-aware supervision); the CE term stays boundary-weighted only.
     """
-    # 1. Predictions and ground truth
+    # 1. Predictions and ground truth. With an active ignore_index, ignored
+    # pixels get all-zero one-hot rows and zeroed probs, so they vanish from
+    # the CE weighting (numerator AND denominator) and from every IoU sum.
     probs = F.softmax(logits, dim=1)
-    gt = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+    if ignore_index >= 0:
+        # For the boundary weights below, remapped no-data acts as background --
+        # deliberately the same convention as the image-border padding.
+        probs, target, gt = mask_ignored(probs, target, num_classes, ignore_index)
+    else:
+        gt = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
 
     # 2. Boundary weights (pad the label map with class 0 before one-hot,
     #    so "outside the image" counts as background in every channel)
@@ -108,11 +140,13 @@ def multiclass_structure_loss(logits, target, num_classes, w=1, sas=None):
     local_avg = F.avg_pool2d(padded_gt, kernel_size=31, stride=1)
     weights = 1 + 5 * torch.abs(local_avg - gt)
 
-    # 3. Weighted Cross-Entropy (each pixel weighted at its true class)
+    # 3. Weighted Cross-Entropy (each pixel weighted at its true class).
+    # No ignore_index here: target was already remapped (ignored -> 0) and
+    # those pixels carry pixel_weights 0, which removes them from both sums.
     ce = F.cross_entropy(logits, target, reduction="none")
     pixel_weights = (weights * gt).sum(dim=1)
 
-    wce = (ce * pixel_weights).sum((1, 2)) / pixel_weights.sum((1, 2))
+    wce = (ce * pixel_weights).sum((1, 2)) / pixel_weights.sum((1, 2)).clamp(min=1e-6)
 
     # 4. Weighted Soft IoU over foreground classes
     overlap = probs * gt
@@ -176,8 +210,10 @@ def test(model, path, dataset, opt):
             predictions = ress[0] if isinstance(ress, list) else ress
             
             for i in range(len(images)):
-                # Note: original_shapes in some loaders is [W, H], in others [H, W]
-                # We ensure it matches your specific data loader's return order
+                # KNOWN QUIRK, kept for protocol continuity: original_shapes is
+                # PIL img.size = (W, H), so these indices transpose non-square
+                # images. Pred and GT receive the identical transform, so scores
+                # are self-consistent; all published runs used this protocol.
                 h_orig, w_orig = int(original_shapes[0][i]), int(original_shapes[1][i])
                 
                 # 1. Prediction Resize (Bilinear for soft maps)
@@ -226,6 +262,7 @@ def test_multiclass(model, path, dataset, opt):
     )
 
     C = opt.num_classes
+    ig = getattr(opt, 'ignore_index', -100)
     dice_sum, iou_sum, class_n = np.zeros(C), np.zeros(C), np.zeros(C, dtype=int)
     total_images = 0
 
@@ -244,16 +281,21 @@ def test_multiclass(model, path, dataset, opt):
                 # Resize logits (bilinear on soft scores), then argmax -> label map
                 p = predictions[i].unsqueeze(0)
                 p = F.interpolate(p, size=(h_orig, w_orig), mode='bilinear', align_corners=False)
+                if 0 <= ig < C:
+                    p[:, ig] = float('-inf')        # never predict the ignored class
                 pred_map = p.argmax(dim=1).squeeze(0)                   # [H, W]
 
                 # Resize GT label map with nearest to keep class indices intact
                 g = gts[i].unsqueeze(0).float()
                 gt_map = F.interpolate(g, size=(h_orig, w_orig), mode='nearest').squeeze().long()
+                valid = (gt_map != ig)   # all-True when ig=-100: labels are never negative
 
                 for c in range(C):
-                    if (gt_map == c).any():
-                        pb = (pred_map == c).float()
-                        gb = (gt_map == c).float()
+                    if c == ig:
+                        continue
+                    if ((gt_map == c) & valid).any():
+                        pb = ((pred_map == c) & valid).float()
+                        gb = ((gt_map == c) & valid).float()
                         dice_sum[c] += dice_coefficient(pb, gb).item()
                         iou_sum[c] += iou(pb, gb).item()
                         class_n[c] += 1
@@ -261,7 +303,10 @@ def test_multiclass(model, path, dataset, opt):
 
     per_class_dice = np.divide(dice_sum, class_n, out=np.zeros(C), where=class_n > 0)
     per_class_iou = np.divide(iou_sum, class_n, out=np.zeros(C), where=class_n > 0)
-    mean_fg_dice = per_class_dice[1:].mean()
+    # mean over scored classes only: a class absent from the whole split must
+    # not deflate the selection metric with a structural zero
+    scored = class_n[1:] > 0
+    mean_fg_dice = per_class_dice[1:][scored].mean() if scored.any() else 0.0
     return mean_fg_dice, per_class_dice, per_class_iou, total_images
 
 def train(train_loader, model, optimizer, epoch, opt, model_name):
@@ -305,9 +350,11 @@ def train(train_loader, model, optimizer, epoch, opt, model_name):
                 else:
                     sas_cfg = None
                 if opt.mc_loss == 'structure':
-                    base = lambda o: multiclass_structure_loss(o, targets, opt.num_classes, sas=sas_cfg)
+                    base = lambda o: multiclass_structure_loss(o, targets, opt.num_classes, sas=sas_cfg,
+                                                               ignore_index=opt.ignore_index)
                 else:
-                    base = lambda o: ce_dice_loss(o, targets, opt.num_classes, sas=sas_cfg)
+                    base = lambda o: ce_dice_loss(o, targets, opt.num_classes, sas=sas_cfg,
+                                                  ignore_index=opt.ignore_index)
                 loss = sum(w * base(o) for w, o in zip(stage_w, outs))
 
             loss.backward()
@@ -369,6 +416,8 @@ if __name__ == '__main__':
                              "(at img_size scale), or an explicit pixel value")
     parser.add_argument('--sas_alpha', type=float, default=0.5)
     parser.add_argument('--sas_wmax', type=float, default=10.0)
+    parser.add_argument('--ignore_index', type=int, default=-100,
+                        help='label excluded from loss and evaluation (e.g. 0 for LoveDA no-data); default -100 = disabled')
     parser.add_argument('--epoch', type=int, default=200)
     parser.add_argument('--lr', type=float, default=0.0005) # base learning rate is 0.0005 for CosineAnnealingLR and 0.0001 for no scheduler
     parser.add_argument('--batchsize', type=int, default=8)
@@ -389,6 +438,11 @@ if __name__ == '__main__':
         opt.train_path = f'./data/polyp/target/{dataset_name}/train/'
     if not opt.test_path:
         opt.test_path = f'./data/polyp/target/{dataset_name}/'
+
+    assert opt.ignore_index in (-100, 0), \
+        "--ignore_index supports only 0 (ignore the no-data label) or -100 (disabled)"
+    if opt.ignore_index >= 0:
+        assert opt.num_classes > 1, "--ignore_index is implemented for the multiclass path only"
 
     if opt.sas:
         assert opt.num_classes > 1, "--sas is implemented for multiclass losses"
@@ -426,7 +480,8 @@ if __name__ == '__main__':
         fix_tag = "fx_"  # fixed multi-scale protocol; untagged runs used the released loop
         loss_tag = "siou_" if (opt.num_classes > 1 and opt.mc_loss == 'structure') else ""
         ds_tag = ("ds_" if opt.deep_supervision else "") + ("sas_" if opt.sas else "")
-        run_id = (f"{dataset_name}_{chosen_net}_{fix_tag}{cls_tag}{loss_tag}{ds_tag}bs{opt.batchsize}_lr{opt.lr}_"
+        ig_tag = f"ig{opt.ignore_index}_" if opt.ignore_index >= 0 else ""
+        run_id = (f"{dataset_name}_{chosen_net}_{fix_tag}{cls_tag}{loss_tag}{ds_tag}{ig_tag}bs{opt.batchsize}_lr{opt.lr}_"
                       f"e{opt.epoch}_aug{opt.augmentation}_run{run}_t{timestamp}")
         opt.train_save = f'./model_pth/{run_id}/'
         
